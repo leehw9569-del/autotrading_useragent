@@ -230,6 +230,42 @@ async def _notify_position_heartbeat(symbol: str, pos: dict):
     await _post_to_central("/api/agent/position-heartbeat", payload)
 
 
+async def _notify_direction_switch(symbol: str, old_pos: dict, new_pos: dict):
+    """방향 전환 콜백 (LONG→SHORT or SHORT→LONG)"""
+    import time
+    client = get_exchange_client()
+    detected_at_ms = int(time.time() * 1000)
+
+    new_side_raw = (new_pos.get("side") or "").lower()
+    new_direction = "SHORT" if new_side_raw == "short" else "LONG"
+
+    payload = {
+        "symbol": symbol,
+        "new_direction": new_direction,
+        "new_qty": str(new_pos.get("contracts", "0")),
+        "new_entry_price": str(new_pos.get("entryPrice", "0")),
+    }
+
+    # 기존 포지션 청산 PnL 조회
+    for attempt in range(6):
+        try:
+            candidate = await client.get_closed_pnl(symbol)
+            if candidate:
+                created_time = int(candidate.get("createdTime", 0))
+                if created_time > detected_at_ms - 120_000:
+                    if candidate.get("avgExitPrice"):
+                        payload["exit_price"] = str(candidate["avgExitPrice"])
+                    if candidate.get("closedPnl") is not None:
+                        payload["realized_pnl"] = str(candidate["closedPnl"])
+                    break
+        except Exception as e:
+            logger.warning(f"[ManualDetect] direction_switch pnl 조회 실패 (attempt {attempt + 1}): {e}")
+        if attempt < 5:
+            await asyncio.sleep(5)
+
+    await _post_to_central("/api/agent/direction-switch", payload)
+
+
 async def _notify_tp_filled(symbol: str, pos: dict, prev_qty: float, curr_qty: float):
     """TP 부분 체결 콜백"""
     qty_closed = round(prev_qty - curr_qty, 9)
@@ -290,6 +326,18 @@ async def detect_manual_positions():
                         logger.info(f"[ManualDetect] 수동 포지션 감지: {symbol}")
                         await _notify_manual_position(symbol, pos, is_addon=False)
                 else:
+                    # 방향 전환 감지 (LONG↔SHORT)
+                    prev_side = (known.get("side") or "").lower()
+                    curr_side = (pos.get("side") or "").lower()
+                    if prev_side and curr_side and prev_side != curr_side:
+                        logger.info(
+                            f"[ManualDetect] 방향 전환 감지: {symbol} "
+                            f"{prev_side.upper()} → {curr_side.upper()}"
+                        )
+                        await _notify_direction_switch(symbol, known, pos)
+                        _known_positions[symbol] = pos
+                        continue
+
                     # qty 증가 → 수동 추가매수
                     prev_qty = float(known.get("contracts", 0) or 0)
                     curr_qty = float(pos.get("contracts", 0) or 0)
