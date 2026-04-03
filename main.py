@@ -11,18 +11,27 @@ import hmac
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from pydantic import BaseModel, Field
 
 from config import settings
 from exchange_client import AgentExchangeClient, ExchangeError
+
+limiter = Limiter(key_func=get_remote_address)
+
+# ===== Replay attack 방지 nonce 캐시 =====
+_used_nonces: dict[str, float] = {}
 
 # ===== 로깅 설정 =====
 logging.basicConfig(
@@ -91,8 +100,8 @@ def check_timestamp(timestamp_str: str, max_age_seconds: int = 60) -> bool:
 # ===== 스키마 =====
 
 class ExecuteRequest(BaseModel):
-    order_type: str             # "market_entry"|"close"|"set_sl"|"set_leverage"|"cancel_order"|"cancel_all"|"adjust"
-    symbol: str
+    order_type: Literal["market_entry", "close", "set_sl", "set_leverage", "cancel_order", "cancel_all", "adjust"]
+    symbol: str = Field(pattern=r"^[A-Z0-9]{2,20}$")
     side: Optional[str] = None          # "Buy" or "Sell"
     qty: Optional[str] = None           # 수량 문자열 (정밀도 처리는 거래소 클라이언트에서)
     price: Optional[str] = None         # 지정가 주문 가격 문자열
@@ -138,15 +147,25 @@ def _normalize_symbol(raw_symbol: str) -> str:
 
 
 async def _post_to_central(path: str, payload: dict):
-    """공통 메인서버 콜백"""
+    """공통 메인서버 콜백 (HMAC-SHA256 서명 포함)"""
     if not settings.central_url:
         return
     try:
+        payload_bytes = json.dumps(payload, sort_keys=True, default=str).encode()
+        sig = hmac.new(
+            settings.token_secret.encode(),
+            payload_bytes,
+            hashlib.sha256,
+        ).hexdigest()
         async with httpx.AsyncClient(verify=True, timeout=10.0) as http:
             resp = await http.post(
                 f"{settings.central_url_normalized}{path}",
-                json=payload,
-                headers={"Authorization": f"Bearer {settings.agent_token}"},
+                content=payload_bytes,
+                headers={
+                    "Authorization": f"Bearer {settings.agent_token}",
+                    "X-Agent-Signature": sig,
+                    "Content-Type": "application/json",
+                },
             )
             if resp.status_code == 200:
                 logger.info(f"[ManualDetect] 콜백 성공: {path}")
@@ -424,6 +443,16 @@ async def detect_manual_positions():
             logger.error(f"[ManualDetect] 폴링 오류: {e}")
 
 
+async def _run_polling_supervisor():
+    """폴링 루프 슈퍼바이저 — 예외로 종료 시 30초 후 재시작"""
+    while True:
+        try:
+            await detect_manual_positions()
+        except Exception as e:
+            logger.error(f"[ManualDetect] 루프 비정상 종료, 30초 후 재시작: {e}")
+            await asyncio.sleep(30)
+
+
 # ===== Lifespan =====
 
 @asynccontextmanager
@@ -444,7 +473,7 @@ async def lifespan(app: FastAPI):
             "Railway 서비스에서 Settings → Networking → Generate Domain으로 퍼블릭 도메인을 생성하세요."
         )
 
-    asyncio.create_task(detect_manual_positions())
+    asyncio.create_task(_run_polling_supervisor())
     logger.info(f"Agent started: exchange={settings.exchange}")
     yield
     logger.info("Agent shutting down")
@@ -458,12 +487,15 @@ app = FastAPI(
     description="User-side trading execution agent",
     lifespan=lifespan
 )
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # ===== 주문 실행 엔드포인트 =====
 
 @app.post("/execute")
-async def execute_order(request: ExecuteRequest):
+@limiter.limit("30/minute")
+async def execute_order(http_request: Request, request: ExecuteRequest):
     """
     중앙 서버에서 전달받은 주문 실행
 
@@ -485,6 +517,16 @@ async def execute_order(request: ExecuteRequest):
     if not verify_hmac_signature(payload_copy):
         logger.warning(f"HMAC verification failed for order_type={request.order_type}")
         raise HTTPException(status_code=401, detail="Invalid HMAC signature")
+
+    # 3. Nonce 중복 방지 (60초 창 내 동일 서명 재전송 차단)
+    sig_val = payload.get("hmac_signature", "")
+    _now = time.time()
+    expired_keys = [k for k, v in _used_nonces.items() if _now - v > 60]
+    for k in expired_keys:
+        del _used_nonces[k]
+    if sig_val in _used_nonces:
+        raise HTTPException(status_code=400, detail="Duplicate request")
+    _used_nonces[sig_val] = _now
 
     client = get_exchange_client()
     symbol = request.symbol
@@ -671,8 +713,8 @@ async def execute_order(request: ExecuteRequest):
 
 # ===== 공개 핑 (Railway 헬스체크용 — 인증 불필요) =====
 
-@app.get("/ping")
-async def ping():
+@app.get("/healthz")
+async def healthz():
     return {"status": "ok"}
 
 
